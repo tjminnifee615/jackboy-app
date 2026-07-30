@@ -94,6 +94,13 @@ const upsertRow = (table, token, row, onConflict) =>
 const deleteRow = (table, token, id) =>
   apiFetch(`/rest/v1/${table}?id=eq.${id}`, { method: "DELETE", token, headers: { Prefer: "return=minimal" } });
 
+const deleteReactionRow = (token, messageId, userId, emoji) =>
+  apiFetch(`/rest/v1/message_reactions?message_id=eq.${messageId}&user_id=eq.${userId}&emoji=eq.${encodeURIComponent(emoji)}`, {
+    method: "DELETE",
+    token,
+    headers: { Prefer: "return=minimal" },
+  });
+
 const uploadFile = (bucket, path, file, token) =>
   apiFetch(`/storage/v1/object/${bucket}/${path}`, {
     method: "POST",
@@ -192,6 +199,7 @@ export default function JackboyApp() {
   const [tab, setTabRaw] = useState("home");
 
   const [chatMessages, setChatMessages] = useState([]);
+  const [reactions, setReactions] = useState({}); // messageId -> [{id, user_id, username, emoji}]
   const [playbookDocs, setPlaybookDocs] = useState([]);
   const [gameplanWeeks, setGameplanWeeks] = useState([]);
   const [presentationDecks, setPresentationDecks] = useState([]);
@@ -230,6 +238,7 @@ export default function JackboyApp() {
     seenPresentationIds.current = new Set();
     seenScheduleId.current = null;
     setChatMessages([]);
+    setReactions({});
     setPlaybookDocs([]);
     setGameplanWeeks([]);
     setPresentationDecks([]);
@@ -355,6 +364,7 @@ export default function JackboyApp() {
   const mapDoc = (r) => ({
     id: r.id,
     filename: r.filename,
+    title: r.title,
     kind: r.kind,
     url: r.kind === "link" ? r.url : publicFileUrl("playbook", r.file_path),
     filePath: r.file_path,
@@ -374,6 +384,7 @@ export default function JackboyApp() {
   const mapDeck = (r) => ({
     id: r.id,
     filename: r.filename,
+    title: r.title,
     kind: r.kind,
     url: r.kind === "link" ? r.url : publicFileUrl("presentations", r.file_path),
     filePath: r.file_path,
@@ -400,18 +411,27 @@ export default function JackboyApp() {
         playbookRows = [],
         gameplanRows = [],
         presentationRows = [],
-        scheduleRows = [];
+        scheduleRows = [],
+        reactionRows = [];
       try {
-        [chatRows, playbookRows, gameplanRows, presentationRows, scheduleRows] = await Promise.all([
+        [chatRows, playbookRows, gameplanRows, presentationRows, scheduleRows, reactionRows] = await Promise.all([
           fetchTable("messages", token, "select=*&order=created_at.asc&limit=300"),
           fetchTable("playbook_docs", token, "select=*&order=created_at.desc"),
           fetchTable("gameplan_weeks", token, "select=*&order=created_at.asc"),
           fetchTable("presentations", token, "select=*&order=created_at.desc"),
           fetchTable("daily_schedule", token, `schedule_date=eq.${todayDateString()}&select=*`),
+          fetchTable("message_reactions", token, "select=*"),
         ]);
       } catch (e) {
         return; // network hiccup — try again next tick
       }
+
+      const grouped = {};
+      reactionRows.forEach((r) => {
+        if (!grouped[r.message_id]) grouped[r.message_id] = [];
+        grouped[r.message_id].push(r);
+      });
+      setReactions(grouped);
 
       const chat = chatRows.map(mapMessage);
       const playbook = playbookRows.map(mapDoc);
@@ -487,6 +507,26 @@ export default function JackboyApp() {
   }, [session, fireNotification]);
 
   // ---------- actions ----------
+  const toggleReaction = async (messageId, emoji) => {
+    const token = sessionRef.current.accessToken;
+    const uid = sessionRef.current.userId;
+    const mine = (reactions[messageId] || []).find((r) => r.user_id === uid);
+
+    // optimistic local update
+    setReactions((prev) => {
+      const list = (prev[messageId] || []).filter((r) => r.user_id !== uid);
+      if (!mine || mine.emoji !== emoji) list.push({ id: `pending-${Date.now()}`, message_id: messageId, user_id: uid, username: profile.username, emoji });
+      return { ...prev, [messageId]: list };
+    });
+
+    try {
+      if (mine) await deleteReactionRow(token, messageId, uid, mine.emoji);
+      if (!mine || mine.emoji !== emoji) {
+        await insertRow("message_reactions", token, { message_id: messageId, user_id: uid, username: profile.username, emoji });
+      }
+    } catch (e) {}
+  };
+
   const sendChatMessage = async (text) => {
     if (!text.trim()) return;
     const token = sessionRef.current.accessToken;
@@ -500,13 +540,13 @@ export default function JackboyApp() {
     setChatMessages((prev) => [...prev, mapped]);
   };
 
-  const uploadPlaybookDoc = async (file) => {
+  const uploadPlaybookDoc = async (file, title) => {
     if (file.size > MAX_FILE_BYTES) return { error: "That file is too large (max ~45MB)." };
     const token = sessionRef.current.accessToken;
     try {
       const path = `${Date.now()}_${sanitizeFilename(file.name)}`;
       await uploadFile("playbook", path, file, token);
-      const row = await insertRow("playbook_docs", token, { filename: file.name, file_path: path, kind: "file", uploaded_by: profile.username });
+      const row = await insertRow("playbook_docs", token, { filename: file.name, title: title || null, file_path: path, kind: "file", uploaded_by: profile.username });
       const mapped = mapDoc(row);
       seenPlaybookIds.current.add(mapped.id);
       setPlaybookDocs((prev) => [mapped, ...prev]);
@@ -516,9 +556,9 @@ export default function JackboyApp() {
     }
   };
 
-  const addPlaybookLink = async (url, name) => {
+  const addPlaybookLink = async (url, name, title) => {
     const token = sessionRef.current.accessToken;
-    const row = await insertRow("playbook_docs", token, { filename: name || nameFromUrl(url), url, kind: "link", uploaded_by: profile.username });
+    const row = await insertRow("playbook_docs", token, { filename: name || nameFromUrl(url), title: title || null, url, kind: "link", uploaded_by: profile.username });
     const mapped = mapDoc(row);
     seenPlaybookIds.current.add(mapped.id);
     setPlaybookDocs((prev) => [mapped, ...prev]);
@@ -560,13 +600,13 @@ export default function JackboyApp() {
     setGameplanWeeks((prev) => [...prev, mapped]);
   };
 
-  const uploadPresentationDeck = async (file) => {
+  const uploadPresentationDeck = async (file, title) => {
     if (file.size > MAX_FILE_BYTES) return { error: "That file is too large (max ~45MB)." };
     const token = sessionRef.current.accessToken;
     try {
       const path = `${Date.now()}_${sanitizeFilename(file.name)}`;
       await uploadFile("presentations", path, file, token);
-      const row = await insertRow("presentations", token, { filename: file.name, file_path: path, kind: "file", uploaded_by: profile.username });
+      const row = await insertRow("presentations", token, { filename: file.name, title: title || null, file_path: path, kind: "file", uploaded_by: profile.username });
       const mapped = mapDeck(row);
       seenPresentationIds.current.add(mapped.id);
       setPresentationDecks((prev) => [mapped, ...prev]);
@@ -576,9 +616,9 @@ export default function JackboyApp() {
     }
   };
 
-  const addPresentationLink = async (url, name) => {
+  const addPresentationLink = async (url, name, title) => {
     const token = sessionRef.current.accessToken;
-    const row = await insertRow("presentations", token, { filename: name || nameFromUrl(url), url, kind: "link", uploaded_by: profile.username });
+    const row = await insertRow("presentations", token, { filename: name || nameFromUrl(url), title: title || null, url, kind: "link", uploaded_by: profile.username });
     const mapped = mapDeck(row);
     seenPresentationIds.current.add(mapped.id);
     setPresentationDecks((prev) => [mapped, ...prev]);
@@ -694,7 +734,9 @@ export default function JackboyApp() {
               onRemove={removeTodaySchedule}
             />
           )}
-          {tab === "chat" && <ChatTab user={user} messages={chatMessages} onSend={sendChatMessage} />}
+          {tab === "chat" && (
+            <ChatTab user={user} messages={chatMessages} onSend={sendChatMessage} reactions={reactions} onReact={toggleReaction} />
+          )}
           {tab === "playbook" && (
             <PlaybookTab user={user} docs={playbookDocs} onUpload={uploadPlaybookDoc} onAddLink={addPlaybookLink} onRemove={removePlaybookDoc} />
           )}
@@ -915,10 +957,7 @@ function HomeTab({ user, schedule, onUpload, onAddLink, onRemove }) {
   const today = new Date().toLocaleDateString([], { weekday: "long", month: "long", day: "numeric" });
   const isImage = schedule?.kind === "file" && /\.(png|jpe?g|gif|webp|heic)$/i.test(schedule.filename || "");
 
-  const upload = async (e) => {
-    const file = e.target.files[0];
-    e.target.value = "";
-    if (!file) return;
+  const upload = async (file) => {
     setErr("");
     setBusy(true);
     try {
@@ -954,7 +993,7 @@ function HomeTab({ user, schedule, onUpload, onAddLink, onRemove }) {
             <div className="min-w-0">
               <p className="text-sm font-semibold truncate">{schedule.filename}</p>
               <p className="text-[11px] text-neutral-500">
-                Posted by {schedule.uploadedBy}
+                Posted by {schedule.uploadedBy} at {new Date(schedule.date).toLocaleString([], { hour: "2-digit", minute: "2-digit" })}
                 {schedule.kind === "link" && (
                   <span style={{ color: ORANGE }} className="font-semibold">
                     {" "}· LINK
@@ -980,9 +1019,13 @@ function HomeTab({ user, schedule, onUpload, onAddLink, onRemove }) {
 }
 
 // ---------- Chat ----------
-function ChatTab({ user, messages, onSend }) {
+const TAPBACK_EMOJIS = ["❤️", "👍", "👎", "😂", "‼️", "❓"];
+
+function ChatTab({ user, messages, onSend, reactions, onReact }) {
   const [text, setText] = useState("");
+  const [pickerFor, setPickerFor] = useState(null);
   const bottomRef = useRef(null);
+  const pressTimer = useRef(null);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -994,19 +1037,81 @@ function ChatTab({ user, messages, onSend }) {
     setText("");
   };
 
+  const startPress = (id) => {
+    pressTimer.current = setTimeout(() => setPickerFor(id), 420);
+  };
+  const cancelPress = () => {
+    if (pressTimer.current) clearTimeout(pressTimer.current);
+  };
+
+  const pickEmoji = (messageId, emoji) => {
+    onReact(messageId, emoji);
+    setPickerFor(null);
+  };
+
+  const groupReactions = (messageId) => {
+    const list = reactions[messageId] || [];
+    const byEmoji = {};
+    list.forEach((r) => {
+      if (!byEmoji[r.emoji]) byEmoji[r.emoji] = [];
+      byEmoji[r.emoji].push(r.username);
+    });
+    return Object.entries(byEmoji).map(([emoji, users]) => ({ emoji, count: users.length, mine: users.includes(user.username) }));
+  };
+
   return (
     <div className="flex flex-col h-full">
-      <div className="px-4 py-3 flex flex-col gap-3">
+      <div className="px-4 py-3 flex flex-col gap-4">
         {messages.length === 0 && <p className="text-neutral-400 text-sm text-center mt-10">No messages yet — say something to the team.</p>}
         {messages.map((m) => {
           const own = m.sender === user.username;
+          const badges = groupReactions(m.id);
           return (
             <div key={m.id} className={`flex ${own ? "justify-end" : "justify-start"}`}>
-              <div className="max-w-[75%]">
+              <div className="max-w-[75%] relative">
                 {!own && <p className="text-[11px] text-neutral-500 mb-0.5 ml-1">{m.sender}</p>}
-                <div style={{ background: own ? ORANGE : "white", color: own ? BLACK : "#111" }} className="rounded-2xl px-3 py-2 text-sm shadow-sm">
+
+                {pickerFor === m.id && (
+                  <div
+                    style={{ background: BLACK }}
+                    className={`absolute -top-11 z-30 flex gap-1 rounded-full px-2 py-1.5 shadow-lg ${own ? "right-0" : "left-0"}`}
+                  >
+                    {TAPBACK_EMOJIS.map((e) => (
+                      <button key={e} onClick={() => pickEmoji(m.id, e)} className="text-lg leading-none px-0.5 active:scale-110">
+                        {e}
+                      </button>
+                    ))}
+                  </div>
+                )}
+
+                <div
+                  onMouseDown={() => startPress(m.id)}
+                  onMouseUp={cancelPress}
+                  onMouseLeave={cancelPress}
+                  onTouchStart={() => startPress(m.id)}
+                  onTouchEnd={cancelPress}
+                  style={{ background: own ? ORANGE : "white", color: own ? BLACK : "#111" }}
+                  className="rounded-2xl px-3 py-2 text-sm shadow-sm select-none"
+                >
                   {m.text}
                 </div>
+
+                {badges.length > 0 && (
+                  <div className={`flex flex-wrap gap-1 mt-1 ${own ? "justify-end" : "justify-start"}`}>
+                    {badges.map((b) => (
+                      <button
+                        key={b.emoji}
+                        onClick={() => onReact(m.id, b.emoji)}
+                        style={{ background: b.mine ? ORANGE : "white", borderColor: b.mine ? ORANGE : "#e5e5e5" }}
+                        className="text-xs rounded-full border px-2 py-0.5 shadow-sm flex items-center gap-1"
+                      >
+                        <span>{b.emoji}</span>
+                        {b.count > 1 && <span className="text-[10px] text-neutral-600">{b.count}</span>}
+                      </button>
+                    ))}
+                  </div>
+                )}
+
                 <p className={`text-[10px] text-neutral-400 mt-0.5 ${own ? "text-right mr-1" : "ml-1"}`}>{formatTime(m.ts)}</p>
               </div>
             </div>
@@ -1014,6 +1119,9 @@ function ChatTab({ user, messages, onSend }) {
         })}
         <div ref={bottomRef} />
       </div>
+
+      {pickerFor && <div className="fixed inset-0 z-20" onClick={() => setPickerFor(null)} />}
+
       <div className="sticky bottom-16 bg-white border-t border-neutral-200 px-3 py-2 flex items-center gap-2 mt-auto">
         <input
           value={text}
@@ -1031,20 +1139,42 @@ function ChatTab({ user, messages, onSend }) {
 }
 
 // ---------- Upload or paste-a-link toggle ----------
-function UploadOrLink({ accept, onFile, onLink, uploadLabel, busy }) {
+function UploadOrLink({ accept, onFile, onLink, uploadLabel, busy, titleOptions }) {
   const [mode, setMode] = useState("file");
   const [url, setUrl] = useState("");
   const [name, setName] = useState("");
+  const [title, setTitle] = useState(titleOptions?.[0] || "");
+
+  const handleFileChange = (e) => {
+    const file = e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    onFile(file, title);
+  };
 
   const submitLink = () => {
     if (!url.trim()) return;
-    onLink(url.trim(), name.trim());
+    onLink(url.trim(), name.trim(), title);
     setUrl("");
     setName("");
   };
 
   return (
     <div className="mb-4">
+      {titleOptions && (
+        <select
+          value={title}
+          onChange={(e) => setTitle(e.target.value)}
+          className="w-full bg-neutral-100 rounded-lg px-3 py-2.5 text-sm outline-none mb-2 appearance-none"
+        >
+          {titleOptions.map((opt) => (
+            <option key={opt} value={opt}>
+              {opt}
+            </option>
+          ))}
+        </select>
+      )}
+
       <div className="flex rounded-lg overflow-hidden mb-2" style={{ background: "#EEE" }}>
         <button type="button" onClick={() => setMode("file")} className="flex-1 py-1.5 text-xs font-semibold tracking-wide" style={{ background: mode === "file" ? ORANGE : "transparent", color: mode === "file" ? BLACK : "#777" }}>
           UPLOAD FILE
@@ -1058,7 +1188,7 @@ function UploadOrLink({ accept, onFile, onLink, uploadLabel, busy }) {
         <label style={{ borderColor: ORANGE }} className="border-2 border-dashed rounded-xl flex items-center justify-center gap-2 py-4 cursor-pointer text-sm font-semibold">
           <Upload size={16} color={ORANGE} />
           <span style={{ color: ORANGE }}>{busy ? "Uploading..." : uploadLabel}</span>
-          <input type="file" accept={accept} className="hidden" onChange={onFile} disabled={busy} />
+          <input type="file" accept={accept} className="hidden" onChange={handleFileChange} disabled={busy} />
         </label>
       ) : (
         <div className="bg-white rounded-xl p-3 shadow-sm flex flex-col gap-2">
@@ -1078,26 +1208,26 @@ function UploadOrLink({ accept, onFile, onLink, uploadLabel, busy }) {
 function PlaybookTab({ user, docs, onUpload, onAddLink, onRemove }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
+  const titleOptions = ["Practice Plan", "Game Plan", "Scouting Report", "Film Study", "Walkthrough", "Team Notes", "Other"];
 
-  const upload = async (e) => {
-    const file = e.target.files[0];
-    e.target.value = "";
-    if (!file) return;
+  const upload = async (file, title) => {
     setErr("");
     setBusy(true);
     try {
-      const result = await onUpload(file);
+      const result = await onUpload(file, title);
       if (result?.error) setErr(result.error);
     } finally {
       setBusy(false);
     }
   };
 
+  const addLink = (url, name, title) => onAddLink(url, name, title);
+
   return (
     <div className="px-4 py-4">
       <SectionHeader title="Playbook" subtitle="Daily uploads from the coaching staff" icon={<BookOpen size={18} />} />
 
-      {user.role === "admin" && <UploadOrLink accept="application/pdf" onFile={upload} onLink={onAddLink} uploadLabel="Upload today's PDF" busy={busy} />}
+      {user.role === "admin" && <UploadOrLink accept="application/pdf" onFile={upload} onLink={addLink} uploadLabel="Upload today's PDF" busy={busy} titleOptions={titleOptions} />}
       {err && <p className="text-red-500 text-xs mb-3">{err}</p>}
 
       {docs.length === 0 && <EmptyState text="No playbook files yet." />}
@@ -1106,9 +1236,10 @@ function PlaybookTab({ user, docs, onUpload, onAddLink, onRemove }) {
         {docs.map((d) => (
           <div key={d.id} className="bg-white rounded-xl px-3 py-3 flex items-center justify-between shadow-sm">
             <div className="min-w-0">
-              <p className="text-sm font-semibold truncate">{d.filename}</p>
+              <p className="text-sm font-semibold truncate">{d.title || d.filename}</p>
+              {d.title && <p className="text-[11px] text-neutral-400 truncate">{d.filename}</p>}
               <p className="text-[11px] text-neutral-500">
-                {new Date(d.date).toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" })} · {d.uploadedBy}
+                {new Date(d.date).toLocaleString([], { month: "short", day: "numeric", year: "numeric", hour: "2-digit", minute: "2-digit" })} · {d.uploadedBy}
                 {d.kind === "link" && (
                   <span style={{ color: ORANGE }} className="font-semibold">
                     {" "}· LINK
@@ -1233,11 +1364,9 @@ function GamePlanTab({ user, weeks, onUpload, onAddLink }) {
     setIndex(Math.max(0, weeks.length - 1));
   }, [weeks.length]);
 
-  const upload = async (e) => {
-    const file = e.target.files[0];
-    e.target.value = "";
-    if (!file || !label.trim()) {
-      if (!label.trim()) setErr("Give this week a label first (e.g. Week 1: Aug 25).");
+  const upload = async (file) => {
+    if (!label.trim()) {
+      setErr("Give this week a label first (e.g. Week 1: Aug 25).");
       return;
     }
     setErr("");
@@ -1301,7 +1430,7 @@ function GamePlanTab({ user, weeks, onUpload, onAddLink }) {
               <div className="min-w-0">
                 <p className="text-sm font-semibold truncate">{current.filename}</p>
                 <p className="text-[11px] text-neutral-500">
-                  Posted {new Date(current.date).toLocaleDateString()} · {current.uploadedBy}
+                  Posted {new Date(current.date).toLocaleString([], { month: "short", day: "numeric", year: "numeric", hour: "2-digit", minute: "2-digit" })} · {current.uploadedBy}
                   {current.kind === "link" && (
                     <span style={{ color: ORANGE }} className="font-semibold">
                       {" "}· LINK
@@ -1324,20 +1453,20 @@ function GamePlanTab({ user, weeks, onUpload, onAddLink }) {
 function PresentationsTab({ user, decks, onUpload, onAddLink, onRemove }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
+  const titleOptions = ["Team Meeting", "Film Session", "Scouting Report", "Guest Speaker", "Recruiting", "Banquet", "Other"];
 
-  const upload = async (e) => {
-    const file = e.target.files[0];
-    e.target.value = "";
-    if (!file) return;
+  const upload = async (file, title) => {
     setErr("");
     setBusy(true);
     try {
-      const result = await onUpload(file);
+      const result = await onUpload(file, title);
       if (result?.error) setErr(result.error);
     } finally {
       setBusy(false);
     }
   };
+
+  const addLink = (url, name, title) => onAddLink(url, name, title);
 
   return (
     <div className="px-4 py-4">
@@ -1347,9 +1476,10 @@ function PresentationsTab({ user, decks, onUpload, onAddLink, onRemove }) {
         <UploadOrLink
           accept=".ppt,.pptx,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation"
           onFile={upload}
-          onLink={onAddLink}
+          onLink={addLink}
           uploadLabel="Upload a presentation"
           busy={busy}
+          titleOptions={titleOptions}
         />
       )}
       {err && <p className="text-red-500 text-xs mb-3">{err}</p>}
@@ -1364,9 +1494,10 @@ function PresentationsTab({ user, decks, onUpload, onAddLink, onRemove }) {
                 <Presentation size={16} color={ORANGE} />
               </div>
               <div className="min-w-0">
-                <p className="text-sm font-semibold truncate">{d.filename}</p>
+                <p className="text-sm font-semibold truncate">{d.title || d.filename}</p>
+                {d.title && <p className="text-[11px] text-neutral-400 truncate">{d.filename}</p>}
                 <p className="text-[11px] text-neutral-500">
-                  {new Date(d.date).toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" })} · {d.uploadedBy}
+                  {new Date(d.date).toLocaleString([], { month: "short", day: "numeric", year: "numeric", hour: "2-digit", minute: "2-digit" })} · {d.uploadedBy}
                   {d.kind === "link" && (
                     <span style={{ color: ORANGE }} className="font-semibold">
                       {" "}· LINK
